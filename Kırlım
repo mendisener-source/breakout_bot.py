@@ -14,8 +14,12 @@ TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", 6084552159))
 
 # Breakout Stratejisi İzleme Listesi (Kaldıraçlı & Yüksek Oynaklıklı Varlıklar)
 WATCHLIST = [
-    "AMZZ", "NFLU", "AVL", "SMCX", "GOOX", "FUGU", "PTIR",
-    "USD", "CONL", "BITX", "LABU", "CURE", "ERX", "DRN", "RETU"
+    # Long ETF'ler & Hisseler
+    "AMZZ", "NFLU", "AVL", "SMCX", "GOOX", "PTIR", "AAPL",
+    "USD", "CONL", "BITX", "LABU", "CURE", "ERX", "DRN", "RETU", "SPXL", "SOXL",
+    
+    # Bear / Short (Ters) ETF'ler
+    "AAPD", "NVDD", "SOXS", "SBIT", "CONI", "SPXS", "LABD", "DRV", "ERY"
 ]
 
 TIMEFRAMES = {
