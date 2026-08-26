@@ -32,7 +32,7 @@ def run_health_check_server():
 
 # --- SEMBOL LİSTELERİ ---
 WATCHLIST = ['SPXL', 'SPXS', 'SOXL', 'SOXS', 'TQQQ', 'SQQQ', 'NVDU', 'NVDD', 'TSLL', 'TSLZ', 'AAPL', 'AAPD']
-PAIR_TUPLES = [('SPXL', 'SPXS'), ('SOXL', 'SOXS'), ('TQQQ', 'SQQQ'),('GLD', 'SLV')]
+PAIR_TUPLES = [('SPXL', 'SPXS'), ('SOXL', 'SOXS'), ('TQQQ', 'SQQQ'), ('NVDU', 'NVDD')]
 
 # --- STRATEJİ 1: RSI & STOCHASTIC 15/85 KIRILIM STRATEJİSİ ---
 def check_custom_long_short_strategy(df, ticker):
