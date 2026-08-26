@@ -1,172 +1,181 @@
 import os
 import time
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 # --- TELEGRAM VE SUNUCU AYARLARI ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
+# Takip Edilecek ABD Sembol Listesi
+SYMBOLS = ["SPXL", "SPXS", "SOXL", "SOXS", "TQQQ", "SQQQ", "NVDU", "NVDD"]
+
+# Günlük Takip Bayrakları (Hafıza)
+sent_signals_today = set()
+heartbeat_sent_today = False
+close_summary_sent_today = False
+last_reset_day = datetime.now().day
+
 def send_telegram_message(message):
+    """Telegram mesajı gönderir."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        return response.ok
     except Exception as e:
-        print(f"Telegram hatası (*error*): {e}")
+        print(f"[HATA] Telegram mesajı gönderilemedi: {e}")
+        return False
 
-# Render Canlı Tutma Sunucusu (*Health Check Server*)
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is live and running!")
-
-def run_health_check_server():
-    server = HTTPServer(('0.0.0.0', 10000), HealthCheckHandler)
-    server.serve_forever()
-
-# --- SEMBOL LİSTELERİ ---
-WATCHLIST = ['SPXL', 'SPXS', 'SOXL', 'SOXS', 'TQQQ', 'SQQQ', 'NVDU', 'NVDD', 'TSLL', 'TSLZ', 'AAPL', 'AAPD']
-PAIR_TUPLES = [('SPXL', 'SPXS'), ('SOXL', 'SOXS'), ('TQQQ', 'SQQQ'), ('NVDU', 'NVDD')]
-
-# --- STRATEJİ 1: RSI & STOCHASTIC 15/85 KIRILIM STRATEJİSİ ---
-def check_custom_long_short_strategy(df, ticker):
-    if len(df) < 30: return None
-    
-    # 1. Heikin Ashi Hesaplama
-    ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-    ha_open = [(df['Open'].iloc[0] + df['Close'].iloc[0]) / 2]
-    for i in range(1, len(df)):
-        ha_open.append((ha_open[i-1] + ha_close.iloc[i-1]) / 2)
-    df['HA_Close'] = ha_close
-    df['HA_Open'] = ha_open
-    
-    # 2. Bollinger Bands (20, 2.5 STD)
-    df['SMA20'] = df['Close'].rolling(window=20).mean()
-    df['STD20'] = df['Close'].rolling(window=20).std()
-    df['LowerBand25'] = df['SMA20'] - (df['STD20'] * 2.5)
-    df['UpperBand25'] = df['SMA20'] + (df['STD20'] * 2.5)
-
-    # 3. RSI (3 Günlük)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+def calculate_rsi(series, period=3):
+    """RSI hesaplar."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
-    df['RSI3'] = 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs))
 
-    # 4. Stochastic Oscillator (14, 3, 3)
-    low14 = df['Low'].rolling(window=14).min()
-    high14 = df['High'].rolling(window=14).max()
-    df['StochK'] = 100 * ((df['Close'] - low14) / (high14 - low14))
+def calculate_stochastic(df, period=14, smooth_k=3, smooth_d=3):
+    """Stochastic Oscillator hesaplar."""
+    low_min = df['Low'].rolling(window=period).min()
+    high_max = df['High'].rolling(window=period).max()
+    k = 100 * ((df['Close'] - low_min) / (high_max - low_min))
+    k_smoothed = k.rolling(window=smooth_k).mean()
+    d_smoothed = k_smoothed.rolling(window=smooth_d).mean()
+    return k_smoothed, d_smoothed
 
-    # Mevcut (Current) ve Bir Önceki (Previous) Mum Değerleri
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # Heikin Ashi Rengi tespiti
-    ha_color_str = "🟢 Yeşil" if curr['HA_Close'] > curr['HA_Open'] else "🔴 Kırmızı"
-
-    # --- 15 SEVİYESİNİ YUKARI KIRMA (LONG SİNYALİ) ---
-    rsi_break_up = (prev['RSI3'] < 15) and (curr['RSI3'] >= 15)
-    stoch_break_up = (prev['StochK'] < 15) and (curr['StochK'] >= 15)
-
-    if rsi_break_up and stoch_break_up and (curr['Close'] <= curr['LowerBand25']):
-        return (
-            f"🎯 *ÖZEL STRATEJİ: DİP LONG KIRILIMI*\n"
-            f"Sembol: `{ticker}`\n"
-            f"Fiyat: ${curr['Close']:.2f}\n"
-            f"Heikin Ashi: {ha_color_str}\n"
-            f"RSI(3): {prev['RSI3']:.1f} ➔ *{curr['RSI3']:.1f}* (15 Yukarı Kırıldı!)\n"
-            f"Stochastic %K: {prev['StochK']:.1f} ➔ *{curr['StochK']:.1f}* (15 Yukarı Kırıldı!)\n"
-            f"Bollinger: 2.5 STD Alt Bandında!"
-        )
-
-    # --- 85 SEVİYESİNİ AŞAĞI KIRMA (SHORT SİNYALİ) ---
-    rsi_break_down = (prev['RSI3'] > 85) and (curr['RSI3'] <= 85)
-    stoch_break_down = (prev['StochK'] > 85) and (curr['StochK'] <= 85)
-
-    if rsi_break_down and stoch_break_down and (curr['Close'] >= curr['UpperBand25']):
-        return (
-            f"🔻 *ÖZEL STRATEJİ: ZİRVE SHORT KIRILIMI*\n"
-            f"Sembol: `{ticker}`\n"
-            f"Fiyat: ${curr['Close']:.2f}\n"
-            f"Heikin Ashi: {ha_color_str}\n"
-            f"RSI(3): {prev['RSI3']:.1f} ➔ *{curr['RSI3']:.1f}* (85 Aşağı Kırıldı!)\n"
-            f"Stochastic %K: {prev['StochK']:.1f} ➔ *{curr['StochK']:.1f}* (85 Aşağı Kırıldı!)\n"
-            f"Bollinger: 2.5 STD Üst Bandında!"
-        )
-
-    return None
-
-# --- STRATEJİ 2: BREAKOUT (TREND KIRILIMI) ---
-def check_breakout(df, ticker):
-    if len(df) < 200: return None
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    df['High20'] = df['High'].shift(1).rolling(window=20).max()
-    df['VolAvg20'] = df['Volume'].shift(1).rolling(window=20).mean()
-
-    curr = df.iloc[-1]
-    if (curr['Close'] > curr['High20']) and (curr['Close'] > curr['EMA50']) and (curr['Close'] > curr['EMA200']):
-        if curr['Volume'] >= (curr['VolAvg20'] * 1.5):
-            return f"🚀 *BREAKOUT AL SINYALI*\nSembol: `{ticker}`\nFiyat: ${curr['Close']:.2f}\nHacim: Güçlü (>1.5x)"
-    return None
-
-# --- STRATEJİ 3: PAIR TRADING (Z-SCORE SPREAD) ---
-def check_pair_trading(ticker_a, ticker_b):
-    df_a = yf.download(ticker_a, period="3mo", interval="1d", progress=False)
-    df_b = yf.download(ticker_b, period="3mo", interval="1d", progress=False)
+def run_screener():
+    global sent_signals_today, heartbeat_sent_today, close_summary_sent_today, last_reset_day
     
-    if df_a.empty or df_b.empty: return None
-    
-    ratio = df_a['Close'] / df_b['Close']
-    mean = ratio.rolling(window=30).mean()
-    std = ratio.rolling(window=30).std()
-    z_score = (ratio - mean) / std
+    now = datetime.now()
+    current_day = now.day
+    current_weekday = now.weekday()  # 0=Pazartesi, 4=Cuma, 5=Cumartesi, 6=Pazar
 
-    current_z = z_score.iloc[-1]
-    if isinstance(current_z, pd.Series): current_z = current_z.item()
+    # Gece yarısı geçtiğinde tüm hafızayı sıfırla
+    if current_day != last_reset_day:
+        sent_signals_today.clear()
+        heartbeat_sent_today = False
+        close_summary_sent_today = False
+        last_reset_day = current_day
+        print("[INFO] Yeni gün başladı, sinyal ve bildirim hafızaları sıfırlandı.")
 
-    if current_z > 2.0:
-        return f"⚖️ *PAIR TRADING SINYALI*\nOran: `{ticker_a}/{ticker_b}`\nZ-Score: +{current_z:.2f}\nAksiyon: `{ticker_b}` Long / `{ticker_a}` Short"
-    elif current_z < -2.0:
-        return f"⚖️ *PAIR TRADING SINYALI*\nOran: `{ticker_a}/{ticker_b}`\nZ-Score: {current_z:.2f}\nAksiyon: `{ticker_a}` Long / `{ticker_b}` Short"
-    return None
+    print(f"\n[INFO] Tarama Başladı: {now.strftime('%d.%m.%Y %H:%M:%S')}")
 
-# --- ANA TARAMA DÖNGÜSÜ (*MAIN SCAN LOOP*) ---
-def main_loop():
-    send_telegram_message("🤖 *Bot Başlatıldı:* RSI & Stochastic 15/85 Kırılım Stratejiniz Aktif!")
-    while True:
+    # ==========================================================
+    # 1. ABD BORSA AÇILIŞ BİLDİRİMİ (TSİ 16:20)
+    # ==========================================================
+    if current_weekday < 5 and not heartbeat_sent_today:
+        if now.hour == 16 and now.minute >= 20:
+            open_msg = (
+                f"🔔 **US Market Open Alert (Bot Active)**\n"
+                f"📅 **Date:** `{now.strftime('%d.%m.%Y')}`\n"
+                f"⏰ **Time (TR):** `{now.strftime('%H:%M:%S')}`\n"
+                f"📊 **Tracked Tickers:** `{len(SYMBOLS)}` units\n"
+                f"🚀 *US market scan is live. Good trading session!*"
+            )
+            send_telegram_message(open_msg)
+            heartbeat_sent_today = True
+            print("[INFO] ABD borsa açılış bildirim mesajı gönderildi.")
+
+    # ==========================================================
+    # 2. TEKNİK ANALİZ VE TARAMA DÖNGÜSÜ
+    # ==========================================================
+    for symbol in SYMBOLS:
         try:
-            print("Tarama başlatılıyor (*Scanning*)...")
-            for ticker in WATCHLIST:
-                data = yf.download(ticker, period="6mo", interval="1d", progress=False)
-                if not data.empty:
-                    # 1. RSI & Stoch 15/85 Kırılım Stratejisi
-                    msg1 = check_custom_long_short_strategy(data, ticker)
-                    if msg1: send_telegram_message(msg1)
+            df = yf.download(symbol, period="1mo", interval="15m", progress=False)
+            if df.empty or len(df) < 20:
+                continue
 
-                    # 2. Breakout Stratejisi
-                    msg2 = check_breakout(data, ticker)
-                    if msg2: send_telegram_message(msg2)
+            # MultiIndex düzeltmesi
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-            # 3. Pair Trading Stratejisi
-            for pair in PAIR_TUPLES:
-                msg3 = check_pair_trading(pair[0], pair[1])
-                if msg3: send_telegram_message(msg3)
+            # İndikatör Hesaplamaları
+            df['RSI'] = calculate_rsi(df['Close'], period=3)
+            df['Stoch_K'], df['Stoch_D'] = calculate_stochastic(df, period=14, smooth_k=3, smooth_d=3)
+            
+            # Bollinger Bantları (2.5 Std Dev)
+            df['SMA20'] = df['Close'].rolling(window=20).mean()
+            df['STD20'] = df['Close'].rolling(window=20).std()
+            df['Upper_BB'] = df['SMA20'] + (df['STD20'] * 2.5)
+            df['Lower_BB'] = df['SMA20'] - (df['STD20'] * 2.5)
+
+            # Son Mum Verileri
+            last_row = df.iloc[-1]
+            close_price = last_row['Close']
+            rsi_val = last_row['RSI']
+            stoch_k = last_row['Stoch_K']
+            stoch_d = last_row['Stoch_D']
+            
+            # --- STRATEJİ KONTROLLERİ ---
+            # LONG Sinyali: RSI < 15, Stoch K < 15 ve Lower BB Teması
+            is_long = (rsi_val < 15) and (stoch_k < 15) and (close_price <= last_row['Lower_BB'])
+            
+            # SHORT Sinyali: RSI > 85, Stoch K > 85 ve Upper BB Teması
+            is_short = (rsi_val > 85) and (stoch_k > 85) and (close_price >= last_row['Upper_BB'])
+
+            if is_long:
+                signal_key = f"{symbol}_LONG_{now.strftime('%Y-%m-%d')}"
+                if signal_key not in sent_signals_today:
+                    msg = (
+                        f"🟢 **LONG SİNYALİ: {symbol}**\n"
+                        f"💰 **Fiyat:** `{close_price:.2f}`\n"
+                        f"📊 **RSI (3):** `{rsi_val:.1f}` | **Stoch K:** `{stoch_k:.1f}`\n"
+                        f"⚠️ *Aşırı dip bölgesi ve Bollinger alt bant teması!*"
+                    )
+                    send_telegram_message(msg)
+                    sent_signals_today.add(signal_key)
+
+            elif is_short:
+                signal_key = f"{symbol}_SHORT_{now.strftime('%Y-%m-%d')}"
+                if signal_key not in sent_signals_today:
+                    msg = (
+                        f"🔴 **SHORT SİNYALİ: {symbol}**\n"
+                        f"💰 **Fiyat:** `{close_price:.2f}`\n"
+                        f"📊 **RSI (3):** `{rsi_val:.1f}` | **Stoch K:** `{stoch_k:.1f}`\n"
+                        f"⚠️ *Aşırı zirve bölgesi ve Bollinger üst bant teması!*"
+                    )
+                    send_telegram_message(msg)
+                    sent_signals_today.add(signal_key)
+
+            time.sleep(1) # yfinance rate limit engelleyici
 
         except Exception as e:
-            print(f"Döngü hatası (*Loop error*): {e}")
+            print(f"[HATA] {symbol} taranırken hata oluştu: {e}")
 
-        time.sleep(900)  # 15 dakikada bir çalışır
+    # ==========================================================
+    # 3. ABD BORSA KAPANIŞ ÖZET BİLDİRİMİ (TSİ 23:00)
+    # ==========================================================
+    if current_weekday < 5 and not close_summary_sent_today:
+        if now.hour == 23 and now.minute >= 0:
+            close_msg = (
+                f"🔔 **US Market Close Summary**\n"
+                f"📅 **Date:** `{now.strftime('%d.%m.%Y')}`\n"
+                f"⏰ **Time (TR):** `{now.strftime('%H:%M:%S')}`\n"
+                f"📈 **Total Signals Triggered Today:** `{len(sent_signals_today)}`\n"
+                f"😴 *US market is closed. Night scanning mode active.*"
+            )
+            send_telegram_message(close_msg)
+            close_summary_sent_today = True
+            print("[INFO] ABD borsa kapanış özet mesajı gönderildi.")
 
+# --- ANA ÇALIŞMA DÖNGÜSÜ ---
 if __name__ == "__main__":
-    t = threading.Thread(target=run_health_check_server)
-    t.daemon = True
-    t.start()
-    main_loop()
+    # Başlangıç Test Mesajı
+    send_telegram_message("🤖 **Breakout & Reversal Bot Başlatıldı:** ABD Piyasa Taraması Aktif!")
+    
+    while True:
+        try:
+            run_screener()
+        except Exception as e:
+            print(f"[CRITICAL HATA] Ana döngü hatası: {e}")
+            
+        print("[INFO] Tarama tamamlandı. 15 dakika (900 sn) bekleniyor...")
+        time.sleep(900)
