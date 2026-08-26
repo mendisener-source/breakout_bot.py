@@ -1,143 +1,172 @@
 import os
 import time
-import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-import warnings
-warnings.filterwarnings('ignore')
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "7651339989:AAEH88cimbHLwq3D01AyN95ohadu3RWthjM")
-TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", 6084552159))
+# --- TELEGRAM VE SUNUCU AYARLARI ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
-# Breakout Stratejisi İzleme Listesi (Kaldıraçlı & Yüksek Oynaklıklı Varlıklar)
-WATCHLIST = [
-    # Long ETF'ler & Hisseler
-    "AMZZ", "NFLU", "AVL", "SMCX", "GOOX", "PTIR", "AAPL",
-    "USD", "CONL", "BITX", "LABU", "CURE", "ERX", "DRN", "RETU", "SPXL", "SOXL",
-    
-    # Bear / Short (Ters) ETF'ler
-    "AAPD", "NVDD", "SOXS", "SBIT", "CONI", "SPXS", "LABD", "DRV", "ERY"
-]
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram hatası (*error*): {e}")
 
-TIMEFRAMES = {
-    "1 Saatlik (1H)": {"interval": "1h", "period": "14d"},
-    "4 Saatlik (4H)": {"interval": "60m", "period": "60d", "resample": "4h"},
-    "Günlük (1D)": {"interval": "1d", "period": "120d"}
-}
-
+# Render Canlı Tutma Sunucusu (*Health Check Server*)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Breakout Screener Bot Alive")
+        self.wfile.write(b"Bot is live and running!")
 
 def run_health_check_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server = HTTPServer(('0.0.0.0', 10000), HealthCheckHandler)
     server.serve_forever()
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram gönderme hatası: {e}")
+# --- SEMBOL LİSTELERİ ---
+WATCHLIST = ['SPXL', 'SPXS', 'SOXL', 'SOXS', 'TQQQ', 'SQQQ', 'NVDU', 'NVDD', 'TSLL', 'TSLZ', 'AAPL', 'AAPD']
+PAIR_TUPLES = [('SPXL', 'SPXS'), ('SOXL', 'SOXS'), ('TQQQ', 'SQQQ'),('GLD', 'SLV')]
 
-def calculate_indicators(df):
-    # Donchian Kanalları (20)
-    df['Donchian_High'] = df['High'].rolling(window=20).max().shift(1)
-    df['Donchian_Low'] = df['Low'].rolling(window=20).min().shift(1)
+# --- STRATEJİ 1: RSI & STOCHASTIC 15/85 KIRILIM STRATEJİSİ ---
+def check_custom_long_short_strategy(df, ticker):
+    if len(df) < 30: return None
     
-    # Trend Göstergeleri (EMA 50 & EMA 200)
+    # 1. Heikin Ashi Hesaplama
+    ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
+    ha_open = [(df['Open'].iloc[0] + df['Close'].iloc[0]) / 2]
+    for i in range(1, len(df)):
+        ha_open.append((ha_open[i-1] + ha_close.iloc[i-1]) / 2)
+    df['HA_Close'] = ha_close
+    df['HA_Open'] = ha_open
+    
+    # 2. Bollinger Bands (20, 2.5 STD)
+    df['SMA20'] = df['Close'].rolling(window=20).mean()
+    df['STD20'] = df['Close'].rolling(window=20).std()
+    df['LowerBand25'] = df['SMA20'] - (df['STD20'] * 2.5)
+    df['UpperBand25'] = df['SMA20'] + (df['STD20'] * 2.5)
+
+    # 3. RSI (3 Günlük)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+    rs = gain / loss
+    df['RSI3'] = 100 - (100 / (1 + rs))
+
+    # 4. Stochastic Oscillator (14, 3, 3)
+    low14 = df['Low'].rolling(window=14).min()
+    high14 = df['High'].rolling(window=14).max()
+    df['StochK'] = 100 * ((df['Close'] - low14) / (high14 - low14))
+
+    # Mevcut (Current) ve Bir Önceki (Previous) Mum Değerleri
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Heikin Ashi Rengi tespiti
+    ha_color_str = "🟢 Yeşil" if curr['HA_Close'] > curr['HA_Open'] else "🔴 Kırmızı"
+
+    # --- 15 SEVİYESİNİ YUKARI KIRMA (LONG SİNYALİ) ---
+    rsi_break_up = (prev['RSI3'] < 15) and (curr['RSI3'] >= 15)
+    stoch_break_up = (prev['StochK'] < 15) and (curr['StochK'] >= 15)
+
+    if rsi_break_up and stoch_break_up and (curr['Close'] <= curr['LowerBand25']):
+        return (
+            f"🎯 *ÖZEL STRATEJİ: DİP LONG KIRILIMI*\n"
+            f"Sembol: `{ticker}`\n"
+            f"Fiyat: ${curr['Close']:.2f}\n"
+            f"Heikin Ashi: {ha_color_str}\n"
+            f"RSI(3): {prev['RSI3']:.1f} ➔ *{curr['RSI3']:.1f}* (15 Yukarı Kırıldı!)\n"
+            f"Stochastic %K: {prev['StochK']:.1f} ➔ *{curr['StochK']:.1f}* (15 Yukarı Kırıldı!)\n"
+            f"Bollinger: 2.5 STD Alt Bandında!"
+        )
+
+    # --- 85 SEVİYESİNİ AŞAĞI KIRMA (SHORT SİNYALİ) ---
+    rsi_break_down = (prev['RSI3'] > 85) and (curr['RSI3'] <= 85)
+    stoch_break_down = (prev['StochK'] > 85) and (curr['StochK'] <= 85)
+
+    if rsi_break_down and stoch_break_down and (curr['Close'] >= curr['UpperBand25']):
+        return (
+            f"🔻 *ÖZEL STRATEJİ: ZİRVE SHORT KIRILIMI*\n"
+            f"Sembol: `{ticker}`\n"
+            f"Fiyat: ${curr['Close']:.2f}\n"
+            f"Heikin Ashi: {ha_color_str}\n"
+            f"RSI(3): {prev['RSI3']:.1f} ➔ *{curr['RSI3']:.1f}* (85 Aşağı Kırıldı!)\n"
+            f"Stochastic %K: {prev['StochK']:.1f} ➔ *{curr['StochK']:.1f}* (85 Aşağı Kırıldı!)\n"
+            f"Bollinger: 2.5 STD Üst Bandında!"
+        )
+
+    return None
+
+# --- STRATEJİ 2: BREAKOUT (TREND KIRILIMI) ---
+def check_breakout(df, ticker):
+    if len(df) < 200: return None
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
     df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    # Hacim Ortalaması (20)
-    df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
-    
-    return df
+    df['High20'] = df['High'].shift(1).rolling(window=20).max()
+    df['VolAvg20'] = df['Volume'].shift(1).rolling(window=20).mean()
 
-def fetch_data(symbol, tf_info):
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(interval=tf_info['interval'], period=tf_info['period'])
-        if df.empty or len(df) < 50:
-            return None
-            
-        if "resample" in tf_info:
-            df = df.resample(tf_info['resample']).agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
-            
-        return calculate_indicators(df)
-    except Exception as e:
-        print(f"{symbol} veri çekme hatası: {e}")
-        return None
+    curr = df.iloc[-1]
+    if (curr['Close'] > curr['High20']) and (curr['Close'] > curr['EMA50']) and (curr['Close'] > curr['EMA200']):
+        if curr['Volume'] >= (curr['VolAvg20'] * 1.5):
+            return f"🚀 *BREAKOUT AL SINYALI*\nSembol: `{ticker}`\nFiyat: ${curr['Close']:.2f}\nHacim: Güçlü (>1.5x)"
+    return None
 
-def check_breakout_signals():
-    print("--- Breakout & Trend Taraması Başlatıldı ---")
-    for symbol in WATCHLIST:
-        for tf_name, tf_info in TIMEFRAMES.items():
-            df = fetch_data(symbol, tf_info)
-            if df is None or len(df) < 2:
-                continue
-                
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            
-            close_price = round(curr['Close'], 2)
-            vol_ratio = round(curr['Volume'] / curr['Vol_SMA20'], 2) if curr['Vol_SMA20'] > 0 else 0
-            
-            # 🚀 TREND AL (Breakout Buy) Koşulları:
-            # 1. Kapanış > Donchian Üst Bandı
-            # 2. Close > EMA50 > EMA200 (Yükseliş Trendi)
-            # 3. Hacim > 1.5 * Hacim Ortalaması
-            is_breakout_buy = (
-                curr['Close'] > prev['Donchian_High'] and
-                curr['Close'] > curr['EMA50'] and
-                curr['EMA50'] > curr['EMA200'] and
-                vol_ratio >= 1.5
-            )
-            
-            # 🔻 TREND SAT / STOP Koşulları:
-            # Kapanış Donchian Alt Bandına temas eder veya EMA50 altına düşerse
-            is_breakout_sell = (
-                curr['Close'] < prev['Donchian_Low'] or
-                curr['Close'] < curr['EMA50']
-            )
-            
-            if is_breakout_buy:
-                msg = (
-                    f"🚀 <b>TREND & BREAKOUT AL SİNYALİ</b>\n\n"
-                    f"<b>Varlık:</b> {symbol}\n"
-                    f"<b>Periyot:</b> {tf_name}\n"
-                    f"<b>Kapanış Fiyatı:</b> ${close_price}\n"
-                    f"<b>Hacim Artışı:</b> {vol_ratio}x (Hacim Onaylı)\n"
-                    f"<b>Trend Durumu:</b> Fiyat > EMA50 > EMA200 🟢"
-                )
-                send_telegram(msg)
-                
-            elif is_breakout_sell and curr['Close'] < curr['EMA50']:
-                msg = (
-                    f"🔻 <b>TREND STOP / CIKIS SİNYALİ</b>\n\n"
-                    f"<b>Varlık:</b> {symbol}\n"
-                    f"<b>Periyot:</b> {tf_name}\n"
-                    f"<b>Kapanış Fiyatı:</b> ${close_price}\n"
-                    f"<b>Neden:</b> EMA50 Kırıldı / Donchian Alt Band Teması 🔴"
-                )
-                send_telegram(msg)
-
-if __name__ == "__main__":
-    threading.Thread(target=run_health_check_server, daemon=True).start()
-    send_telegram("⚡ Breakout & Trend Takip Botu Aktif Edildi!")
+# --- STRATEJİ 3: PAIR TRADING (Z-SCORE SPREAD) ---
+def check_pair_trading(ticker_a, ticker_b):
+    df_a = yf.download(ticker_a, period="3mo", interval="1d", progress=False)
+    df_b = yf.download(ticker_b, period="3mo", interval="1d", progress=False)
     
+    if df_a.empty or df_b.empty: return None
+    
+    ratio = df_a['Close'] / df_b['Close']
+    mean = ratio.rolling(window=30).mean()
+    std = ratio.rolling(window=30).std()
+    z_score = (ratio - mean) / std
+
+    current_z = z_score.iloc[-1]
+    if isinstance(current_z, pd.Series): current_z = current_z.item()
+
+    if current_z > 2.0:
+        return f"⚖️ *PAIR TRADING SINYALI*\nOran: `{ticker_a}/{ticker_b}`\nZ-Score: +{current_z:.2f}\nAksiyon: `{ticker_b}` Long / `{ticker_a}` Short"
+    elif current_z < -2.0:
+        return f"⚖️ *PAIR TRADING SINYALI*\nOran: `{ticker_a}/{ticker_b}`\nZ-Score: {current_z:.2f}\nAksiyon: `{ticker_a}` Long / `{ticker_b}` Short"
+    return None
+
+# --- ANA TARAMA DÖNGÜSÜ (*MAIN SCAN LOOP*) ---
+def main_loop():
+    send_telegram_message("🤖 *Bot Başlatıldı:* RSI & Stochastic 15/85 Kırılım Stratejiniz Aktif!")
     while True:
         try:
-            check_breakout_signals()
+            print("Tarama başlatılıyor (*Scanning*)...")
+            for ticker in WATCHLIST:
+                data = yf.download(ticker, period="6mo", interval="1d", progress=False)
+                if not data.empty:
+                    # 1. RSI & Stoch 15/85 Kırılım Stratejisi
+                    msg1 = check_custom_long_short_strategy(data, ticker)
+                    if msg1: send_telegram_message(msg1)
+
+                    # 2. Breakout Stratejisi
+                    msg2 = check_breakout(data, ticker)
+                    if msg2: send_telegram_message(msg2)
+
+            # 3. Pair Trading Stratejisi
+            for pair in PAIR_TUPLES:
+                msg3 = check_pair_trading(pair[0], pair[1])
+                if msg3: send_telegram_message(msg3)
+
         except Exception as e:
-            print(f"Tarama döngüsü hatası: {e}")
-        time.sleep(900)  # 15 dakikada bir tarar
+            print(f"Döngü hatası (*Loop error*): {e}")
+
+        time.sleep(900)  # 15 dakikada bir çalışır
+
+if __name__ == "__main__":
+    t = threading.Thread(target=run_health_check_server)
+    t.daemon = True
+    t.start()
+    main_loop()
