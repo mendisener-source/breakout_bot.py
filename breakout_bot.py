@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime
+import pytz
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -9,6 +10,9 @@ import requests
 # --- TELEGRAM VE SUNUCU AYARLARI ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+
+# Türkiye Saat Dilimi Tanımlaması (UTC+3)
+TURKEY_TZ = pytz.timezone("Europe/Istanbul")
 
 # Pair Trading Çiftleri (A / B)
 PAIRS = [
@@ -30,14 +34,19 @@ PAIRS = [
     ("WEBL", "WEBS")    # Internet 3x Bull/Bear
 ]
 
-# Takip Edilecek Tekil Sembol Listesini Çiftlerden Otomatik Çıkar
+# Takip Edilecek Tekil Sembol Listesini Çiftlerden Otomatik Çıkar (32 Sembol)
 SYMBOLS = list(set([sym for pair in PAIRS for sym in pair]))
 
 # Günlük Takip Bayrakları (Hafıza)
 sent_signals_today = set()
-heartbeat_sent_today = False
-close_summary_sent_today = False
-last_reset_day = datetime.now().day
+market_open_sent_today = False
+market_close_sent_today = False
+night_heartbeat_sent_today = False
+last_reset_day = datetime.now(TURKEY_TZ).day
+
+def get_turkey_time():
+    """Türkiye saat dilimine göre mevcut zamanı döndürür."""
+    return datetime.now(TURKEY_TZ)
 
 def send_telegram_message(message):
     """Telegram mesajı gönderir."""
@@ -72,40 +81,57 @@ def calculate_stochastic(df, period=14, smooth_k=3, smooth_d=3):
     return k_smoothed, d_smoothed
 
 def run_screener():
-    global sent_signals_today, heartbeat_sent_today, close_summary_sent_today, last_reset_day
+    global sent_signals_today, market_open_sent_today, market_close_sent_today, night_heartbeat_sent_today, last_reset_day
     
-    now = datetime.now()
+    # Zaman kontrolleri Türkiye Saat Dilimine (Europe/Istanbul) göre yapılır
+    now = get_turkey_time()
     current_day = now.day
     current_weekday = now.weekday()  # 0=Pazartesi, 4=Cuma, 5=Cumartesi, 6=Pazar
 
+    # Gece Yarısı Hafıza Sıfırlama
     if current_day != last_reset_day:
         sent_signals_today.clear()
-        heartbeat_sent_today = False
-        close_summary_sent_today = False
+        market_open_sent_today = False
+        market_close_sent_today = False
+        night_heartbeat_sent_today = False
         last_reset_day = current_day
-        print("[INFO] Yeni gün başladı, sinyal ve bildirim hafızaları sıfırlandı.")
+        print("[INFO] Yeni gün başladı, tüm bildirim hafızaları sıfırlandı.")
 
-    print(f"\n[INFO] Tarama Başladı: {now.strftime('%d.%m.%Y %H:%M:%S')}")
+    print(f"\n[INFO] Tarama Başladı (TSİ): {now.strftime('%d.%m.%Y %H:%M:%S')}")
 
     # ==========================================================
-    # 1. ABD BORSA AÇILIŞ BİLDİRİMİ (TSİ 16:20)
+    # 1. ABD BORSA AÇILIŞ BİLDİRİMİ (TSİ 16:30)
     # ==========================================================
-    if current_weekday < 5 and not heartbeat_sent_today:
-        if now.hour == 16 and now.minute >= 20:
+    if current_weekday < 5 and not market_open_sent_today:
+        if (now.hour == 16 and now.minute >= 30) or now.hour > 16:
             open_msg = (
-                f"🔔 **US Market Open Alert (3 Strateji Aktif)**\n"
-                f"📅 **Date:** `{now.strftime('%d.%m.%Y')}`\n"
-                f"⏰ **Time (TR):** `{now.strftime('%H:%M:%S')}`\n"
-                f"📊 **Tracked Tickers:** `{len(SYMBOLS)}` units\n"
-                f"🔄 **Tracked Pairs:** `{len(PAIRS)}` pairs\n"
-                f"🚀 *Reversal, Breakout ve Multi-Pair Trading canlı!*"
+                f"🔔 **ABD PİYASASI AÇILDI**\n"
+                f"📅 **Tarih:** `{now.strftime('%d.%m.%Y')}`\n"
+                f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
+                f"📊 **Taranan Varlık:** `{len(SYMBOLS)}` adet ETF\n"
+                f"🔄 **Taranan Çift:** `{len(PAIRS)}` pair\n"
+                f"🚀 *3 Strateji (Reversal, Breakout, Pair Trading) aktif taranıyor!*"
             )
             send_telegram_message(open_msg)
-            heartbeat_sent_today = True
-            print("[INFO] ABD borsa açılış bildirim mesajı gönderildi.")
+            market_open_sent_today = True
+            print("[INFO] ABD Borsa Açılış Bildirimi Gönderildi.")
 
     # ==========================================================
-    # 2. STRATEJİ 1 & STRATEJİ 2: TEKİL VARLIK TARAMASI
+    # 2. GECE / HAFTA SONU YAŞAM SİNYALİ (TSİ 03:00)
+    # ==========================================================
+    if not night_heartbeat_sent_today and now.hour == 3:
+        heartbeat_msg = (
+            f"💓 **SİSTEM YAŞAM SİNYALİ (HEARTBEAT)**\n"
+            f"📅 **Tarih:** `{now.strftime('%d.%m.%Y')}`\n"
+            f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
+            f"✅ *Sunucu aktif, kod sorunsuz çalışmaya devam ediyor.*"
+        )
+        send_telegram_message(heartbeat_msg)
+        night_heartbeat_sent_today = True
+        print("[INFO] Gece Yaşam Sinyali Gönderildi.")
+
+    # ==========================================================
+    # 3. STRATEJİ 1 & STRATEJİ 2: TEKİL VARLIK TARAMASI
     # ==========================================================
     for symbol in SYMBOLS:
         try:
@@ -126,7 +152,7 @@ def run_screener():
             df['Upper_BB'] = df['SMA20'] + (df['STD20'] * 2.5)
             df['Lower_BB'] = df['SMA20'] - (df['STD20'] * 2.5)
 
-            # EMA 50 ve Donchian Bantları (20 Periyot)
+            # EMA 50 ve Donchian Bantları
             df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
             df['Donchian_Upper'] = df['High'].rolling(window=20).max()
             df['Donchian_Lower'] = df['Low'].rolling(window=20).min()
@@ -148,6 +174,7 @@ def run_screener():
                         f"🟢 **REVERSAL LONG SİNYALİ: {symbol}**\n"
                         f"💰 **Fiyat:** `{close_price:.2f}`\n"
                         f"📊 **RSI (3):** `{rsi_val:.1f}` | **Stoch K:** `{stoch_k:.1f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"⚠️ *Aşırı dip bölgesi ve Bollinger alt bant teması!*"
                     )
                     send_telegram_message(msg)
@@ -160,6 +187,7 @@ def run_screener():
                         f"🔴 **REVERSAL SHORT SİNYALİ: {symbol}**\n"
                         f"💰 **Fiyat:** `{close_price:.2f}`\n"
                         f"📊 **RSI (3):** `{rsi_val:.1f}` | **Stoch K:** `{stoch_k:.1f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"⚠️ *Aşırı zirve bölgesi ve Bollinger üst bant teması!*"
                     )
                     send_telegram_message(msg)
@@ -172,6 +200,7 @@ def run_screener():
                     msg = (
                         f"🚀 **BREAKOUT SİNYALİ: {symbol}**\n"
                         f"💰 **Fiyat:** `{close_price:.2f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"📈 **Neden:** Donchian Üst Bandı Yukarı Kırıldı!\n"
                         f"⚡ *Güçlü yukarı momentum tespiti.*"
                     )
@@ -185,18 +214,19 @@ def run_screener():
                     msg = (
                         f"🔻 **TREND STOP / ÇIKIŞ SİNYALİ: {symbol}**\n"
                         f"💰 **Fiyat:** `{close_price:.2f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"⚠️ **Neden:** EMA50 Kırıldı / Donchian Alt Band Teması!"
                     )
                     send_telegram_message(msg)
                     sent_signals_today.add(signal_key)
 
-            time.sleep(0.5)
+            time.sleep(0.4)
 
         except Exception as e:
             print(f"[HATA] {symbol} taranırken hata oluştu: {e}")
 
     # ==========================================================
-    # 3. STRATEJİ 3: PAIR TRADING TARAMASI (16 ÇİFT)
+    # 4. STRATEJİ 3: PAIR TRADING TARAMASI (16 ÇİFT)
     # ==========================================================
     for sym_a, sym_b in PAIRS:
         try:
@@ -227,6 +257,7 @@ def run_screener():
                         f"🔀 **Çift:** `{sym_a} / {sym_b}`\n"
                         f"📈 **Z-Score:** `{last_z:.2f}` (Aşırı Genişleme)\n"
                         f"📊 **Mevcut Rasyo:** `{last_ratio:.4f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"💡 *Öneri:* `{sym_a}` aşırı pahalandı, `{sym_b}` tarafına rotasyon beklentisi (*pair ratio mean reversion*)!"
                     )
                     send_telegram_message(msg)
@@ -240,35 +271,43 @@ def run_screener():
                         f"🔀 **Çift:** `{sym_a} / {sym_b}`\n"
                         f"📉 **Z-Score:** `{last_z:.2f}` (Aşırı Daralma)\n"
                         f"📊 **Mevcut Rasyo:** `{last_ratio:.4f}`\n"
+                        f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
                         f"💡 *Öneri:* `{sym_a}` aşırı ucuzladı, `{sym_a}` tarafına rotasyon beklentisi (*pair ratio mean reversion*)!"
                     )
                     send_telegram_message(msg)
                     sent_signals_today.add(signal_key)
 
-            time.sleep(0.5)
+            time.sleep(0.4)
 
         except Exception as e:
             print(f"[HATA] Pair {sym_a}/{sym_b} taranırken hata oluştu: {e}")
 
     # ==========================================================
-    # 4. ABD BORSA KAPANIŞ ÖZET BİLDİRİMİ (TSİ 23:00)
+    # 5. ABD BORSA KAPANIŞ BİLDİRİMİ (TSİ 23:00)
     # ==========================================================
-    if current_weekday < 5 and not close_summary_sent_today:
-        if now.hour == 23 and now.minute >= 0:
+    if current_weekday < 5 and not market_close_sent_today:
+        if (now.hour == 23 and now.minute >= 0) or now.hour > 23:
             close_msg = (
-                f"🔔 **US Market Close Summary**\n"
-                f"📅 **Date:** `{now.strftime('%d.%m.%Y')}`\n"
-                f"⏰ **Time (TR):** `{now.strftime('%H:%M:%S')}`\n"
-                f"📈 **Total Signals Triggered Today:** `{len(sent_signals_today)}`\n"
-                f"😴 *US market is closed. Night scanning mode active.*"
+                f"🔔 **ABD PİYASASI KAPANDI (ÖZET)**\n"
+                f"📅 **Tarih:** `{now.strftime('%d.%m.%Y')}`\n"
+                f"⏰ **Saat (TSİ):** `{now.strftime('%H:%M:%S')}`\n"
+                f"📈 **Bugün Tetiklenen Sinyal Sayısı:** `{len(sent_signals_today)}` adet\n"
+                f"😴 *Borsa kapandı. Gece tarama modu devam ediyor.*"
             )
             send_telegram_message(close_msg)
-            close_summary_sent_today = True
-            print("[INFO] ABD borsa kapanış özet mesajı gönderildi.")
+            market_close_sent_today = True
+            print("[INFO] ABD Borsa Kapanış Bildirimi Gönderildi.")
 
 # --- ANA ÇALIŞMA DÖNGÜSÜ ---
 if __name__ == "__main__":
-    send_telegram_message("🤖 **Multi-Strategy Bot Başlatıldı:** 16 Pair Çifti & 3 Strateji Aktif!")
+    init_time = get_turkey_time()
+    send_telegram_message(
+        f"🤖 **YENİ SÜRÜM CANLIYA ALINDI!**\n"
+        f"🌍 **Zaman Dilimi:** `Europe/Istanbul (TSİ)`\n"
+        f"⏰ **Başlangıç:** `{init_time.strftime('%d.%m.%Y %H:%M:%S')}`\n"
+        f"📊 **Takip:** 16 Pair / 32 ETF / 3 Strateji\n"
+        f"✅ *Açılış (16:30), Kapanış (23:00) ve Gece (03:00) bildirimleri aktif!*"
+    )
     
     while True:
         try:
