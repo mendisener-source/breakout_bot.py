@@ -1,126 +1,232 @@
 import os
+import json
+import html
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import requests
 import yfinance as yf
-import pandas as pd
-import numpy as np
-import pytz
-import mplfinance as mpf
 
-# ==========================================
-# 1. ORTAM DEĞİŞKENLERİ & AYARLAR
-# ==========================================
+# ============================================================
+# AYARLAR
+# ============================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", 
-    "META", "TSLA", "AMD", "NFLX", "QQQ"
-]
+SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", "QQQ"]
+INTERVAL = "1h"
+PERIOD = "3mo"
 
-# ==========================================
-# 2. TELEGRAM MESAJ & GÖRSEL FONKSİYONLARI
-# ==========================================
-def send_telegram_message(message):
-    """
-    Telegram'a düz metin (durum raporu vb.) gönderir.
-    """
+# Strateji parametreleri
+BREAKOUT_PERIOD = 20
+EMA_FAST = 20
+EMA_SLOW = 50
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOLUME_PERIOD = 20
+VOLUME_FACTOR = 1.20
+STOP_ATR = 1.50
+TARGET_ATR = 3.00
+TRAIL_ATR = 1.50
+
+STATE_FILE = Path("trading_state.json")
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[-] Telegram bilgileri eksik. Mesaj terminale yazdırıldı:")
+        print(message)
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
-    try:
-        requests.post(url, data=payload, timeout=10)
-    except Exception as e:
-        print(f"[-] Mesaj gönderme hatası: {e}")
-
-def send_telegram_photo(photo_path, caption):
-    """
-    Üretilen grafik görselini ve mesajı Telegram'a gönderir.
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        with open(photo_path, 'rb') as photo:
-            payload = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}
-            files = {'photo': photo}
-            requests.post(url, data=payload, files=files, timeout=20)
-    except Exception as e:
-        print(f"[-] Görsel gönderme hatası: {e}")
-
-# ==========================================
-# 3. GRAFİK ÇİZİMİ (TRADINGVIEW DARK THEME)
-# ==========================================
-def generate_chart(df, symbol):
-    filename = f"{symbol}_chart.png"
-    mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', edge='inherit', wick='inherit', volume='#26a69a')
-    style = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', gridcolor='#2a2e39', facecolor='#131722', figcolor='#131722')
-    
-    mpf.plot(
-        df.tail(60),
-        type='candle',
-        volume=True,
-        title=f"\n{symbol} - BREAKOUT CHART",
-        style=style,
-        savefig=dict(fname=filename, dpi=150, bbox_inches='tight')
+    response = requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+        timeout=20,
     )
-    return filename
+    if response.status_code != 200:
+        print(f"[-] Telegram hatası: {response.status_code} - {response.text}")
 
-# ==========================================
-# 4. TEKNİK ANALİZ & TARAMA MOTORU
-# ==========================================
-def analyze_and_scan():
-    print("[*] Tarama başlatılıyor...")
-    
-    # 1. BOTUN YAŞADIĞINI GÖSTEREN BAŞLANGIÇ MESAJI
-    send_telegram_message("🤖 <b>Bot Çalıştı:</b> Piyasalar taranmaya başlandı...")
-    
-    breakout_count = 0
-    
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def prepare_data(df):
+    df = df.copy().dropna(how="all")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Son mum tamamlanmamış olabilir; sinyalde kullanma.
+    if len(df) > 1:
+        df = df.iloc[:-1].copy()
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - df["Close"].shift()).abs(),
+            (df["Low"] - df["Close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["EMA20"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["RSI"] = rsi(df["Close"], RSI_PERIOD)
+    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
+    df["AvgVolume"] = df["Volume"].rolling(VOLUME_PERIOD).mean()
+    df["BreakoutHigh"] = df["High"].shift(1).rolling(BREAKOUT_PERIOD).max()
+    df["BreakoutLow"] = df["Low"].shift(1).rolling(BREAKOUT_PERIOD).min()
+    return df.dropna()
+
+
+def fmt_time(index_value):
+    timestamp = pd.Timestamp(index_value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("Europe/Istanbul").strftime("%d.%m.%Y %H:%M")
+
+
+def make_message(side, symbol, row, entry, stop, target, reason):
+    label = "ALIM SİNYALİ" if side == "LONG" else "SATIŞ SİNYALİ"
+    emoji = "🟢" if side == "LONG" else "🔴"
+    return (
+        f"{emoji} <b>{label}</b>\n\n"
+        f"<b>Hisse:</b> {html.escape(symbol)}\n"
+        f"<b>Fiyat:</b> ${row['Close']:.2f}\n"
+        f"<b>RSI:</b> {row['RSI']:.1f}\n"
+        f"<b>Hacim oranı:</b> {row['Volume'] / row['AvgVolume']:.2f}x\n"
+        f"<b>Giriş:</b> ${entry:.2f}\n"
+        f"<b>Stop:</b> ${stop:.2f}\n"
+        f"<b>Hedef:</b> ${target:.2f}\n"
+        f"<b>Gerekçe:</b> {reason}\n"
+        f"<b>Zaman:</b> {fmt_time(row.name)}"
+    )
+
+
+def scan_symbol(symbol, state):
+    df = yf.Ticker(symbol).history(period=PERIOD, interval=INTERVAL, auto_adjust=False)
+    if df.empty or len(df) < 100:
+        print(f"[-] {symbol}: yeterli veri yok")
+        return
+
+    df = prepare_data(df)
+    row = df.iloc[-1]
+    candle_id = str(df.index[-1])
+    current = state.get(symbol)
+
+    # Açık pozisyon varsa önce çıkış koşullarını kontrol et.
+    if current:
+        side = current["side"]
+        entry = float(current["entry"])
+        stop = float(current["stop"])
+        target = float(current["target"])
+        exit_reason = None
+
+        if side == "LONG":
+            current["highest"] = max(float(current.get("highest", entry)), float(row["High"]))
+            trailing_stop = current["highest"] - TRAIL_ATR * row["ATR"]
+            stop = max(stop, trailing_stop)
+            if row["Low"] <= stop:
+                exit_reason = f"Stop/trailing stop (${stop:.2f})"
+            elif row["High"] >= target:
+                exit_reason = f"Hedef fiyat (${target:.2f})"
+            elif row["Close"] < row["EMA20"]:
+                exit_reason = "EMA20 aşağı kırıldı"
+        else:
+            current["lowest"] = min(float(current.get("lowest", entry)), float(row["Low"]))
+            trailing_stop = current["lowest"] + TRAIL_ATR * row["ATR"]
+            stop = min(stop, trailing_stop)
+            if row["High"] >= stop:
+                exit_reason = f"Stop/trailing stop (${stop:.2f})"
+            elif row["Low"] <= target:
+                exit_reason = f"Hedef fiyat (${target:.2f})"
+            elif row["Close"] > row["EMA20"]:
+                exit_reason = "EMA20 yukarı kırıldı"
+
+        current["stop"] = stop
+        if exit_reason and current.get("last_exit_candle") != candle_id:
+            send_telegram(
+                f"⚪ <b>POZİSYON KAPAT</b>\n\n"
+                f"<b>Hisse:</b> {html.escape(symbol)}\n"
+                f"<b>Yön:</b> {side}\n"
+                f"<b>Çıkış fiyatı:</b> ${row['Close']:.2f}\n"
+                f"<b>Giriş:</b> ${entry:.2f}\n"
+                f"<b>Yaklaşık getiri:</b> {((row['Close'] / entry - 1) * 100 if side == 'LONG' else (entry / row['Close'] - 1) * 100):.2f}%\n"
+                f"<b>Gerekçe:</b> {exit_reason}\n"
+                f"<b>Zaman:</b> {fmt_time(row.name)}"
+            )
+            state.pop(symbol, None)
+        return
+
+    volume_ok = row["Volume"] >= row["AvgVolume"] * VOLUME_FACTOR
+    bullish = (
+        row["Close"] > row["BreakoutHigh"]
+        and row["Close"] > row["EMA20"] > row["EMA50"]
+        and 55 <= row["RSI"] <= 75
+        and volume_ok
+        and row["Close"] > row["Open"]
+    )
+    bearish = (
+        row["Close"] < row["BreakoutLow"]
+        and row["Close"] < row["EMA20"] < row["EMA50"]
+        and 25 <= row["RSI"] <= 45
+        and volume_ok
+        and row["Close"] < row["Open"]
+    )
+
+    # Aynı mumda tekrar tekrar AL/SAT mesajı göndermeyi önle.
+    if state.get(f"{symbol}_last_signal") == candle_id:
+        return
+
+    if bullish:
+        entry = float(row["Close"])
+        stop = entry - STOP_ATR * row["ATR"]
+        target = entry + TARGET_ATR * row["ATR"]
+        send_telegram(make_message("LONG", symbol, row, entry, stop, target, "20 periyot yukarı kırılım + trend/hacim/RSI onayı"))
+        state[symbol] = {"side": "LONG", "entry": entry, "stop": stop, "target": target, "highest": entry}
+        state[f"{symbol}_last_signal"] = candle_id
+    elif bearish:
+        entry = float(row["Close"])
+        stop = entry + STOP_ATR * row["ATR"]
+        target = entry - TARGET_ATR * row["ATR"]
+        send_telegram(make_message("SHORT", symbol, row, entry, stop, target, "20 periyot aşağı kırılım + trend/hacim/RSI onayı"))
+        state[symbol] = {"side": "SHORT", "entry": entry, "stop": stop, "target": target, "lowest": entry}
+        state[f"{symbol}_last_signal"] = candle_id
+    else:
+        print(f"[i] {symbol}: sinyal yok | fiyat ${row['Close']:.2f} | RSI {row['RSI']:.1f}")
+
+
+def main():
+    state = load_state()
+    print("[*] Gelişmiş al-sat taraması başladı...")
     for symbol in SYMBOLS:
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="1mo", interval="1h")
-            
-            if df.empty or len(df) < 20:
-                continue
+            scan_symbol(symbol, state)
+        except Exception as exc:
+            print(f"[-] {symbol} hata: {exc}")
+    save_state(state)
 
-            df['20_High'] = df['High'].shift(1).rolling(window=20).max()
-            df['20_Low'] = df['Low'].shift(1).rolling(window=20).min()
-            
-            last_row = df.iloc[-1]
-            last_close = last_row['Close']
-            prev_high_20 = last_row['20_High']
-            prev_low_20 = last_row['20_Low']
-            
-            is_bullish_breakout = last_close > prev_high_20
-            is_bearish_breakout = last_close < prev_low_20
-
-            if is_bullish_breakout or is_bearish_breakout:
-                breakout_count += 1
-                signal_type = "🚀 <b>YUKARI KIRILIM (BULLISH)</b>" if is_bullish_breakout else "🔻 <b>AŞAĞI KIRILIM (BEARISH)</b>"
-                breakout_level = prev_high_20 if is_bullish_breakout else prev_low_20
-                level_label = "20-Periyot Zirve" if is_bullish_breakout else "20-Periyot Dip"
-                
-                caption = (
-                    f"{signal_type}\n\n"
-                    f"<b>Hisse:</b> {symbol}\n"
-                    f"<b>Son Fiyat:</b> ${last_close:.2f}\n"
-                    f"<b>{level_label}:</b> ${breakout_level:.2f}\n"
-                    f"<b>Zaman:</b> {df.index[-1].strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-                
-                chart_path = generate_chart(df, symbol)
-                send_telegram_photo(chart_path, caption)
-                
-                if os.path.exists(chart_path):
-                    os.remove(chart_path)
-
-        except Exception as e:
-            print(f"[-] {symbol} hatası: {e}")
-
-    # 2. TARAMA BİTTİĞİNDE ÖZET RAPOR MESAJI
-    send_telegram_message(f"✅ <b>Tarama Tamamlandı.</b> Toplam {len(SYMBOLS)} hisse incelendi. Yeni Kırılım Sayısı: <b>{breakout_count}</b>")
 
 if __name__ == "__main__":
-    analyze_and_scan()
+    main()
